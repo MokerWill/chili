@@ -62,7 +62,7 @@ use std::{
 
 mod job;
 
-use job::{Job, JobQueue, JobStack};
+use job::{Job, JobQueue, JobShared, JobStack, Receiver};
 
 #[derive(Debug)]
 struct Heartbeat {
@@ -74,7 +74,7 @@ struct Heartbeat {
 struct LockContext {
     time: u64,
     is_stopping: bool,
-    shared_jobs: BTreeMap<usize, (u64, Job)>,
+    shared_jobs: BTreeMap<usize, (u64, JobShared)>,
     heartbeats: HashMap<u64, Heartbeat>,
     heartbeat_index: u64,
 }
@@ -95,7 +95,7 @@ impl LockContext {
         is_set
     }
 
-    pub fn pop_earliest_shared_job(&mut self) -> Option<Job> {
+    pub fn pop_earliest_shared_job(&mut self) -> Option<JobShared> {
         self.shared_jobs
             .pop_first()
             .map(|(_, (_, shared_job))| shared_job)
@@ -281,26 +281,20 @@ impl<'s> Scope<'s> {
         Arc::as_ptr(&self.heartbeat) as usize
     }
 
-    fn wait_for_sent_job<T>(&mut self, job: &Job<T>) -> Option<thread::Result<T>> {
+    fn wait_for_sent_job<T: Send>(&mut self, receiver: Receiver<T>) -> Option<thread::Result<T>> {
+        if self
+            .context
+            .lock
+            .lock()
+            .unwrap()
+            .shared_jobs
+            .remove(&self.heartbeat_id())
+            .is_some()
         {
-            let mut lock = self.context.lock.lock().unwrap();
-
-            if let Some((_, job)) = lock.shared_jobs.remove(&self.heartbeat_id()) {
-                // SAFETY:
-                // Since the `Future` has already been allocated when
-                // popping from the queue, the `Job` needs manual dropping.
-                unsafe {
-                    job.drop();
-                }
-
-                return None;
-            }
+            return None;
         }
 
-        // SAFETY:
-        // For this `Job` to have crossed thread borders, it must have been
-        // popped from the `JobQueue` and shared.
-        while !unsafe { job.poll() } {
+        while receiver.is_empty() {
             let job = {
                 let mut lock = self.context.lock.lock().unwrap();
                 lock.pop_earliest_shared_job()
@@ -318,10 +312,7 @@ impl<'s> Scope<'s> {
             }
         }
 
-        // SAFETY:
-        // Any `Job` that was shared between threads is waited upon before the
-        // `JobStack` exits scope.
-        unsafe { job.wait() }
+        Some(receiver.recv())
     }
 
     #[cold]
@@ -370,26 +361,16 @@ impl<'s> Scope<'s> {
         };
 
         let stack = JobStack::new(a);
-        let job = Job::new(&stack);
+        let mut job = Job::new(&stack);
 
         // SAFETY:
         // `job` is alive until the end of this scope.
-        unsafe {
-            self.job_queue.push_back(&job);
-        }
+        unsafe { self.job_queue.push_back(&mut job) };
 
         let rb = b(self);
 
-        if job.is_waiting() {
-            self.job_queue.pop_back();
-
-            // SAFETY:
-            // Since the `job` was popped from the back of the queue, it cannot
-            // take the closure out of the `JobStack` anymore.
-            // `JobStack::take_once` is thus called only once.
-            (unsafe { (stack.take_once())(self) }, rb)
-        } else {
-            let ra = match self.wait_for_sent_job(&job) {
+        if let Some(receiver) = job.take_receiver() {
+            let ra = match self.wait_for_sent_job(receiver) {
                 Some(Ok(val)) => val,
                 Some(Err(e)) => panic::resume_unwind(e),
                 // SAFETY:
@@ -401,6 +382,14 @@ impl<'s> Scope<'s> {
             };
 
             (ra, rb)
+        } else {
+            self.job_queue.pop_back();
+
+            // SAFETY:
+            // Since the `job` was popped from the back of the queue, it cannot
+            // take the closure out of the `JobStack` anymore.
+            // `JobStack::take_once` is thus called only once.
+            (unsafe { (stack.take_once())(self) }, rb)
         }
     }
 

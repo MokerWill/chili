@@ -1,105 +1,113 @@
+use core::fmt;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::VecDeque,
-    mem::ManuallyDrop,
+    mem::{self, ManuallyDrop},
     panic::{self, AssertUnwindSafe},
     ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
     thread::{self, Thread},
 };
 
 use crate::Scope;
 
-enum Poll {
+enum State {
     Pending,
+    Waiting,
     Ready,
-    Locked,
 }
 
-#[derive(Debug, Default)]
-pub struct Future<T = ()> {
+#[derive(Debug)]
+#[repr(C)]
+struct Channel<T = ()> {
     state: AtomicU8,
-    /// Can only be accessed if `state` is `Poll::Locked`.
+    /// Can only be written only by the `Receiver` and read by the `Sender` if
+    /// `state` is `State::Waiting`.
     waiting_thread: UnsafeCell<Option<Thread>>,
-    /// Can only be written if `state` is `Poll::Locked` and read if `state` is
-    /// `Poll::Ready`.
+    /// Can only be written only by the `Sender` and read by the `Receiver` if
+    /// `state` is `State::Ready`.
     val: UnsafeCell<Option<Box<thread::Result<T>>>>,
 }
 
-impl<T> Future<T> {
-    pub fn poll(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Poll::Ready as u8
-    }
-
-    pub fn wait(&self) -> Option<thread::Result<T>> {
-        loop {
-            let result = self.state.compare_exchange(
-                Poll::Pending as u8,
-                Poll::Locked as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-
-            match result {
-                Ok(_) => {
-                    // SAFETY:
-                    // Lock is acquired, only we are accessing `self.waiting_thread`.
-                    unsafe { *self.waiting_thread.get() = Some(thread::current()) };
-
-                    self.state.store(Poll::Pending as u8, Ordering::Release);
-
-                    thread::park();
-
-                    // Skip yielding after being woken up.
-                    continue;
-                }
-                Err(state) if state == Poll::Ready as u8 => {
-                    // SAFETY:
-                    // `state` is `Poll::Ready` only after `Self::complete`
-                    // releases the lock.
-                    //
-                    // Calling `Self::complete` when `state` is `Poll::Ready`
-                    // cannot mutate `self.val`.
-                    break unsafe { (*self.val.get()).take().map(|b| *b) };
-                }
-                _ => (),
-            }
-
-            thread::yield_now();
+impl<T> Default for Channel<T> {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(State::Pending as u8),
+            waiting_thread: UnsafeCell::new(None),
+            val: UnsafeCell::new(None),
         }
     }
+}
 
-    pub fn complete(&self, val: thread::Result<T>) {
-        let val = Box::new(val);
+#[derive(Debug)]
+pub struct Receiver<T = ()>(Arc<Channel<T>>);
 
-        loop {
-            let result = self.state.compare_exchange(
-                Poll::Pending as u8,
-                Poll::Locked as u8,
+impl<T: Send> Receiver<T> {
+    pub fn is_empty(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) != State::Ready as u8
+    }
+
+    pub fn recv(self) -> thread::Result<T> {
+        // SAFETY:
+        // Only this thread can write to `waiting_thread` and none can read it
+        // yet.
+        unsafe { *self.0.waiting_thread.get() = Some(thread::current()) };
+
+        if self
+            .0
+            .state
+            .compare_exchange(
+                State::Pending as u8,
+                State::Waiting as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            );
-
-            match result {
-                Ok(_) => break,
-                Err(_) => thread::yield_now(),
-            }
+            )
+            .is_ok()
+        {
+            thread::park();
         }
 
         // SAFETY:
-        // Lock is acquired, only we are accessing `self.val`.
+        // To arrive here, either `state` is `State::Ready` or the above
+        // `compare_exchange` succeeded, the thread was parked and then
+        // unparked by the `Sender` *after* the `state` was set to
+        // `State::Ready`.
+        //
+        // In either case, this thread now has unique access to `val`.
+        unsafe { (*self.0.val.get()).take().map(|b| *b).unwrap() }
+    }
+}
+
+#[derive(Debug)]
+struct Sender<T = ()>(Arc<Channel<T>>);
+
+impl<T: Send> Sender<T> {
+    pub fn send(self, val: thread::Result<T>) {
+        // SAFETY:
+        // Only this thread can write to `val` and none can read it
+        // yet.
         unsafe {
-            *self.val.get() = Some(val);
+            *self.0.val.get() = Some(Box::new(val));
         }
 
-        // SAFETY:
-        // Lock is acquired, only we are accessing `self.waiting_thread`.
-        if let Some(thread) = unsafe { (*self.waiting_thread.get()).take() } {
-            thread.unpark();
+        if self.0.state.swap(State::Ready as u8, Ordering::AcqRel) == State::Waiting as u8 {
+            // SAFETY:
+            // A `Receiver` already wrote its thread to `waiting_thread`
+            // *before* setting the `state` to `State::Waiting`.
+            if let Some(thread) = unsafe { (*self.0.waiting_thread.get()).take() } {
+                thread.unpark();
+            }
         }
-
-        self.state.store(Poll::Ready as u8, Ordering::Release);
     }
+}
+
+fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+    let channel = Arc::new(Channel::default());
+
+    (Sender(channel.clone()), Receiver(channel))
 }
 
 pub struct JobStack<F = ()> {
@@ -129,12 +137,11 @@ impl<F> JobStack<F> {
 ///
 /// When popped from the `JobQueue`, it gets copied before sending across
 /// thread boundaries.
-#[derive(Clone, Debug)]
 #[repr(C)]
 pub struct Job<T = ()> {
     stack: NonNull<JobStack>,
-    harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future>),
-    fut: Cell<Option<NonNull<Future<T>>>>,
+    harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, Sender),
+    receiver: Cell<Option<Receiver<T>>>,
 }
 
 impl<T> Job<T> {
@@ -145,16 +152,13 @@ impl<T> Job<T> {
     {
         /// SAFETY:
         /// It should only be called while the `stack` is still alive.
-        unsafe fn harness<F, T>(
-            scope: &mut Scope<'_>,
-            stack: NonNull<JobStack>,
-            fut: NonNull<Future>,
-        ) where
+        unsafe fn harness<F, T>(scope: &mut Scope<'_>, stack: NonNull<JobStack>, sender: Sender)
+        where
             F: FnOnce(&mut Scope<'_>) -> T + Send,
             T: Send,
         {
             // SAFETY:
-            // The `stack` is still alive.
+            // The `stack` is still alive as per `JobShared::execute`'s contract.
             let stack: &JobStack<F> = unsafe { stack.cast().as_ref() };
             // SAFETY:
             // This is the first call to `take_once` since `Job::execute`
@@ -162,92 +166,72 @@ impl<T> Job<T> {
             // after the job has been popped.
             let f = unsafe { stack.take_once() };
             // SAFETY:
-            // Before being popped, the `JobQueue` allocates and stores a
-            // `Future` in `self.fur_or_next` that should get passed here.
-            let fut: &Future<T> = unsafe { fut.cast().as_ref() };
+            // `Sender` can be safely transmuted to `Sender<T>` since the
+            // `Channel`'s size is the same as `Channel<T>` because the only
+            // field referencing `T` has constant size (`Box`), and the order
+            // of its fields is preserved given that it is `repr(C)`.
+            let sender: Sender<T> = unsafe { mem::transmute(sender) };
 
-            fut.complete(panic::catch_unwind(AssertUnwindSafe(|| f(scope))));
+            sender.send(panic::catch_unwind(AssertUnwindSafe(|| f(scope))));
         }
 
         Self {
             stack: NonNull::from(stack).cast(),
             harness: harness::<F, T>,
-            fut: Cell::new(None),
+            receiver: Cell::new(None),
         }
     }
 
-    pub fn is_waiting(&self) -> bool {
-        self.fut.get().is_none()
-    }
-
-    /// SAFETY:
-    /// It should only be called after being popped from a `JobQueue`.
-    pub unsafe fn poll(&self) -> bool {
-        self.fut
-            .get()
-            .map(|fut| {
-                // SAFETY:
-                // Before being popped, the `JobQueue` allocates and stores a
-                // `Future` in `self.fur_or_next` that should get passed here.
-                let fut = unsafe { fut.as_ref() };
-                fut.poll()
-            })
-            .unwrap_or_default()
-    }
-
-    /// SAFETY:
-    /// It should only be called after being popped from a `JobQueue`.
-    pub unsafe fn wait(&self) -> Option<thread::Result<T>> {
-        self.fut.get().and_then(|fut| {
-            // SAFETY:
-            // Before being popped, the `JobQueue` allocates and stores a
-            // `Future` in `self.fur_or_next` that should get passed here.
-            let result = unsafe { fut.as_ref().wait() };
-            // SAFETY:
-            // We only can drop the `Box` *after* waiting on the `Future`
-            // in order to ensure unique access.
-            unsafe {
-                drop(Box::from_raw(fut.as_ptr()));
-            }
-
-            result
-        })
-    }
-
-    /// SAFETY:
-    /// It should only be called in the case where the job has been popped
-    /// from the front and will not be `Job::Wait`ed.
-    pub unsafe fn drop(&self) {
-        if let Some(fut) = self.fut.get() {
-            // SAFETY:
-            // Before being popped, the `JobQueue` allocates and store a
-            // `Future` in `self.fur_or_next` that should get passed here.
-            unsafe {
-                drop(Box::from_raw(fut.as_ptr()));
-            }
-        }
+    pub fn take_receiver(&self) -> Option<Receiver<T>> {
+        self.receiver.take()
     }
 }
 
-impl Job {
+impl<T: fmt::Debug> fmt::Debug for Job<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let receiver = self.receiver.take();
+
+        let result = f
+            .debug_struct("Job")
+            .field("stack", &self.stack)
+            .field("harness", &self.harness)
+            .field("sender", &receiver)
+            .finish();
+
+        self.receiver.set(receiver);
+
+        result
+    }
+}
+
+#[derive(Debug)]
+pub struct JobShared {
+    stack: NonNull<JobStack>,
+    harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, Sender),
+    sender: Sender,
+}
+
+impl JobShared {
     /// SAFETY:
     /// It should only be called while the `JobStack` it was created with is
     /// still alive and after being popped from a `JobQueue`.
-    pub unsafe fn execute(&self, scope: &mut Scope<'_>) {
+    pub unsafe fn execute(self, scope: &mut Scope<'_>) {
         // SAFETY:
-        // Before being popped, the `JobQueue` allocates and store a
-        // `Future` in `self.fur_or_next` that should get passed here.
+        // The `stack` is still alive as per `JobShared::execute`'s contract.
         unsafe {
-            (self.harness)(scope, self.stack, self.fut.get().unwrap());
+            (self.harness)(scope, self.stack, self.sender);
         }
     }
 }
 
 // SAFETY:
-// The job's `stack` will only be accessed after acquiring a lock (in
-// `Future`), while `prev` and `fut_or_next` are never accessed after being
-// sent across threads.
-unsafe impl Send for Job {}
+// The job's `stack` will only be accessed exclusively from the thread
+// `JobShared::execute`ing the job which also consumes it.
+//
+// The job's `sender` will be accessed either from one thread to check if
+// `Receiver::is_empty` or from the executing thread to `JobShared::execute`
+// which calls `Sender::send` which can be only called once.
+unsafe impl Send for JobShared {}
 
 #[derive(Debug, Default)]
 pub struct JobQueue(VecDeque<NonNull<Job>>);
@@ -261,14 +245,14 @@ impl JobQueue {
     /// Any `Job` pushed onto the queue should alive at least until it gets
     /// popped.
     pub unsafe fn push_back<T>(&mut self, job: &Job<T>) {
-        self.0.push_back(NonNull::from(job).cast());
+        self.0.push_back(NonNull::from(&*job).cast());
     }
 
     pub fn pop_back(&mut self) {
         self.0.pop_back();
     }
 
-    pub fn pop_front(&mut self) -> Option<Job> {
+    pub fn pop_front(&mut self) -> Option<JobShared> {
         // SAFETY:
         // `Job` is still alive as per contract in `push_back`.
         //
@@ -277,9 +261,15 @@ impl JobQueue {
         // `Cell<Option<NonNull<Future<T>>>>` which has constant size, while
         // being `repr(C)` guarantees identical field order.
         let job = unsafe { self.0.pop_front()?.as_ref() };
-        job.fut
-            .set(Some(Box::leak(Box::new(Future::default())).into()));
 
-        Some(job.clone())
+        let (sender, receiver) = channel();
+
+        job.receiver.set(Some(receiver));
+
+        Some(JobShared {
+            stack: job.stack,
+            harness: job.harness,
+            sender,
+        })
     }
 }
