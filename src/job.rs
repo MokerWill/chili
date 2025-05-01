@@ -130,6 +130,7 @@ impl<F> JobStack<F> {
 /// When popped from the `JobQueue`, it gets copied before sending across
 /// thread boundaries.
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct Job<T = ()> {
     stack: NonNull<JobStack>,
     harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future>),
@@ -270,6 +271,11 @@ impl JobQueue {
     pub fn pop_front(&mut self) -> Option<Job> {
         // SAFETY:
         // `Job` is still alive as per contract in `push_back`.
+        //
+        // The previously pushed `Job<T>` is safe to cast to `Job` since the
+        // only field that depends on `T` is of type
+        // `Cell<Option<NonNull<Future<T>>>>` which has constant size, while
+        // being `repr(C)` guarantees identical field order.
         let job = unsafe { self.0.pop_front()?.as_ref() };
         job.fut
             .set(Some(Box::leak(Box::new(Future::default())).into()));
