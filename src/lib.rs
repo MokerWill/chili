@@ -353,11 +353,11 @@ impl<'s> Scope<'s> {
         RB: Send,
     {
         let stack = JobStack::new(a);
-        let mut job = Job::new(&stack);
+        let job = Job::new(&stack);
 
         // SAFETY:
         // `job` is alive until the end of this scope.
-        unsafe { self.job_queue.push_back(&mut job) };
+        unsafe { self.job_queue.push_back(&job) };
 
         if self.heartbeat.load(Ordering::Relaxed) {
             self.heartbeat();
